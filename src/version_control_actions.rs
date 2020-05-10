@@ -2,7 +2,27 @@ use std::process::Command;
 
 use crate::select::Entry;
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum VcsType {
+    Git,
+    Hg,
+}
+
+impl std::fmt::Display for VcsType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                VcsType::Git => "git",
+                VcsType::Hg => "mercurial",
+            }
+        )
+    }
+}
+
 pub trait VersionControlActions {
+    fn get_type(&self) -> VcsType;
     /// Sets the root of the current repository
     fn set_root(&mut self) -> Result<(), String>;
     /// Get the root of the current repository
@@ -20,6 +40,10 @@ pub trait VersionControlActions {
     /// Shows the header and all diffs for the current revision
     fn current_export(&mut self) -> Result<String, String>;
     fn log(&mut self, count: u32) -> Result<String, String>;
+    /// Shows the linear stack of revisions
+    fn current_stack(&mut self) -> Result<String, String> {
+        Ok(format!("Unsupported command for {}", self.get_type()))
+    }
 
     fn current_diff_all(&mut self) -> Result<String, String>;
     fn current_diff_selected(
