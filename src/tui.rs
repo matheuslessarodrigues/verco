@@ -14,6 +14,7 @@ use std::{
     iter,
 };
 
+use crate::settings::{Settings, SettingsError};
 use crate::{
     custom_commands::CustomCommand,
     input,
@@ -51,6 +52,7 @@ where
 
     write: W,
     scroll_view: ScrollView,
+    settings: Settings,
 }
 
 impl<W> Tui<W>
@@ -68,6 +70,17 @@ where
             current_key_chord: Vec::new(),
             write,
             scroll_view: Default::default(),
+            // TODO don't panic, but show an error and use default config
+            settings: match Settings::new() {
+                Ok(s) => s,
+                Err(e) => match e {
+                    SettingsError::ConfigNotFound => Settings::default(),
+                    _ => {
+                        eprintln!("{}", e.to_string());
+                        std::process::exit(1)
+                    }
+                },
+            },
         }
     }
 
@@ -97,7 +110,9 @@ where
     }
 
     fn show(&mut self) -> Result<()> {
-        self.write.execute(EnterAlternateScreen)?;
+        if !self.settings.no_alternate_screen {
+            self.write.execute(EnterAlternateScreen)?;
+        }
         self.write.execute(cursor::Hide)?;
         terminal::enable_raw_mode()?;
 
@@ -157,11 +172,26 @@ where
             cursor::Show
         )?;
         terminal::disable_raw_mode()?;
-        self.write.execute(LeaveAlternateScreen)?;
+        if !self.settings.no_alternate_screen {
+            self.write.execute(LeaveAlternateScreen)?;
+        }
+
         Ok(())
     }
 
     fn handle_command(&mut self) -> Result<HandleChordResult> {
+        if self.settings.read_only {
+            self.handle_read_command()
+        } else {
+            match self.handle_read_command() {
+                Ok(HandleChordResult::Unhandled) => self.handle_write_command(),
+                r => r,
+            }
+        }
+    }
+
+    /// Contains only read-only commands
+    fn handle_read_command(&mut self) -> Result<HandleChordResult> {
         match &self.current_key_chord[..] {
             ['q'] => Ok(HandleChordResult::Quit),
             ['h'] => self.command_context("help", |s, h| {
@@ -178,7 +208,9 @@ where
                 s.handle_result(h, result)
             }),
             ['l', 'c'] => self.command_context("log count", |s, h| {
-                if let Some(input) = s.handle_input("logs to show (ctrl+c to cancel)")? {
+                if let Some(input) =
+                    s.handle_input("logs to show (ctrl+c to cancel)")?
+                {
                     if let Ok(count) = input.parse() {
                         let result = s.version_control.log(count);
                         s.handle_result(h, result)
@@ -196,51 +228,24 @@ where
                 }
             }),
             ['e'] => Ok(HandleChordResult::Unhandled),
-            ['e', 'e'] => self.command_context("current full revision", |s, h| {
-                let result = s.version_control.current_export();
-                s.handle_result(h, result)
-            }),
-            ['d'] => Ok(HandleChordResult::Unhandled),
+            ['e', 'e'] => {
+                self.command_context("current full revision", |s, h| {
+                    let result = s.version_control.current_export();
+                    s.handle_result(h, result)
+                })
+            }
             ['d', 'd'] => self.command_context("current diff all", |s, h| {
                 let result = s.version_control.current_diff_all();
                 s.handle_result(h, result)
             }),
-            ['d', 's'] => self.command_context("current diff selected", |s, h| {
-                match s.version_control.get_current_changed_files() {
-                    Ok(mut entries) => {
-                        if s.show_select_ui(&mut entries)? {
-                            let result = s.version_control.current_diff_selected(&entries);
-                            s.handle_result(h, result)
-                        } else {
-                            s.show_header(h, HeaderKind::Canceled)
-                        }
-                    }
-                    Err(error) => s.handle_result(h, Err(error)),
-                }
-            }),
-            ['D'] => Ok(HandleChordResult::Unhandled),
-            ['D', 'C'] => self.command_context("revision changes", |s, h| {
-                if let Some(input) = s.handle_input("show changes from (ctrl+c to cancel): ")? {
-                    let result = s.version_control.revision_changes(&input[..]);
-                    s.handle_result(h, result)
-                } else {
-                    s.show_header(h, HeaderKind::Canceled)
-                }
-            }),
-            ['D', 'D'] => self.command_context("revision diff all", |s, h| {
-                if let Some(input) = s.handle_input("show diff from (ctrl+c to cancel): ")? {
-                    let result = s.version_control.revision_diff_all(&input[..]);
-                    s.handle_result(h, result)
-                } else {
-                    s.show_header(h, HeaderKind::Canceled)
-                }
-            }),
-            ['D', 'S'] => self.command_context("revision diff selected", |s, h| {
-                if let Some(input) = s.handle_input("show diff from (ctrl+c to cancel): ")? {
-                    match s.version_control.get_revision_changed_files(&input[..]) {
+            ['d', 's'] => {
+                self.command_context("current diff selected", |s, h| {
+                    match s.version_control.get_current_changed_files() {
                         Ok(mut entries) => {
                             if s.show_select_ui(&mut entries)? {
-                                let result = s.version_control.revision_diff_selected(&input[..], &entries);
+                                let result = s
+                                    .version_control
+                                    .current_diff_selected(&entries);
                                 s.handle_result(h, result)
                             } else {
                                 s.show_header(h, HeaderKind::Canceled)
@@ -248,10 +253,77 @@ where
                         }
                         Err(error) => s.handle_result(h, Err(error)),
                     }
+                })
+            }
+            ['D'] => Ok(HandleChordResult::Unhandled),
+            ['D', 'C'] => self.command_context("revision changes", |s, h| {
+                if let Some(input) =
+                    s.handle_input("show changes from (ctrl+c to cancel): ")?
+                {
+                    let result = s.version_control.revision_changes(&input[..]);
+                    s.handle_result(h, result)
                 } else {
                     s.show_header(h, HeaderKind::Canceled)
                 }
             }),
+            ['D', 'D'] => self.command_context("revision diff all", |s, h| {
+                if let Some(input) =
+                    s.handle_input("show diff from (ctrl+c to cancel): ")?
+                {
+                    let result =
+                        s.version_control.revision_diff_all(&input[..]);
+                    s.handle_result(h, result)
+                } else {
+                    s.show_header(h, HeaderKind::Canceled)
+                }
+            }),
+            ['D', 'S'] => {
+                self.command_context("revision diff selected", |s, h| {
+                    if let Some(input) =
+                        s.handle_input("show diff from (ctrl+c to cancel): ")?
+                    {
+                        match s
+                            .version_control
+                            .get_revision_changed_files(&input[..])
+                        {
+                            Ok(mut entries) => {
+                                if s.show_select_ui(&mut entries)? {
+                                    let result = s
+                                        .version_control
+                                        .revision_diff_selected(
+                                            &input[..],
+                                            &entries,
+                                        );
+                                    s.handle_result(h, result)
+                                } else {
+                                    s.show_header(h, HeaderKind::Canceled)
+                                }
+                            }
+                            Err(error) => s.handle_result(h, Err(error)),
+                        }
+                    } else {
+                        s.show_header(h, HeaderKind::Canceled)
+                    }
+                })
+            }
+            ['r', 'r'] => {
+                self.command_context("unresolved conflicts", |s, h| {
+                    let result = s.version_control.conflicts();
+                    s.handle_result(h, result)
+                })
+            }
+            ['b'] => Ok(HandleChordResult::Unhandled),
+            ['b', 'b'] => self.command_context("list branches", |s, h| {
+                let result = s.version_control.list_branches();
+                s.handle_result(h, result)
+            }),
+            _ => Ok(HandleChordResult::Handled),
+        }
+    }
+
+    /// Contains only options that have a write effect on the underlying repo
+    fn handle_write_command(&mut self) -> Result<HandleChordResult> {
+        match &self.current_key_chord[..] {
             ['c'] => Ok(HandleChordResult::Unhandled),
             ['c', 'c'] => self.command_context("commit all", |s, h| {
                 if let Some(input) = s.handle_input("commit message (ctrl+c to cancel): ")? {
@@ -317,10 +389,6 @@ where
                     Err(error) => s.handle_result(h, Err(error)),
                 }
             }),
-            ['r', 'r'] => self.command_context("unresolved conflicts", |s, h| {
-                let result = s.version_control.conflicts();
-                s.handle_result(h, result)
-            }),
             ['r', 'o'] => self.command_context("merge taking other", |s, h| {
                 let result = s.version_control.take_other();
                 s.handle_result(h, result)
@@ -351,10 +419,6 @@ where
                 }
             }),
             ['b'] => Ok(HandleChordResult::Unhandled),
-            ['b', 'b'] => self.command_context("list branches", |s, h| {
-                let result = s.version_control.list_branches();
-                s.handle_result(h, result)
-            }),
             ['b', 'n'] => self.command_context("new branch", |s, h| {
                 if let Some(input) = s.handle_input("new branch name (ctrl+c to cancel): ")? {
                     let result = s.version_control.create_branch(&input[..]);
@@ -539,6 +603,7 @@ where
         header: &Header,
     ) -> Result<std::result::Result<String, String>> {
         let mut write = Vec::with_capacity(1024);
+        let is_read_only = self.settings.read_only;
 
         queue!(
             &mut write,
@@ -581,40 +646,47 @@ where
         Self::show_help_action(&mut write, "DD", "revision diff all")?;
         Self::show_help_action(&mut write, "DS", "revision diff selected")?;
 
-        write.queue(cursor::MoveToNextLine(1))?;
+        if !is_read_only {
+            write.queue(cursor::MoveToNextLine(1))?;
 
-        Self::show_help_action(&mut write, "cc", "commit all")?;
-        Self::show_help_action(&mut write, "cs", "commit selected")?;
-        Self::show_help_action(&mut write, "u", "update/checkout")?;
-        Self::show_help_action(&mut write, "m", "merge")?;
-        Self::show_help_action(&mut write, "RA", "revert all")?;
-        Self::show_help_action(&mut write, "rs", "revert selected")?;
+            Self::show_help_action(&mut write, "cc", "commit all")?;
+            Self::show_help_action(&mut write, "cs", "commit selected")?;
+            Self::show_help_action(&mut write, "u", "update/checkout")?;
+            Self::show_help_action(&mut write, "m", "merge")?;
+            Self::show_help_action(&mut write, "RA", "revert all")?;
+            Self::show_help_action(&mut write, "rs", "revert selected")?;
+        }
 
         write.queue(cursor::MoveToNextLine(1))?;
 
         Self::show_help_action(&mut write, "rr", "list unresolved conflicts")?;
-        Self::show_help_action(&mut write, "ro", "resolve taking other")?;
-        Self::show_help_action(&mut write, "rl", "resolve taking local")?;
+        if !is_read_only {
+            Self::show_help_action(&mut write, "ro", "resolve taking other")?;
+            Self::show_help_action(&mut write, "rl", "resolve taking local")?;
+        }
+        if !is_read_only {
+            write.queue(cursor::MoveToNextLine(1))?;
 
-        write.queue(cursor::MoveToNextLine(1))?;
+            Self::show_help_action(&mut write, "f", "fetch")?;
+            Self::show_help_action(&mut write, "p", "pull")?;
+            Self::show_help_action(&mut write, "P", "push")?;
 
-        Self::show_help_action(&mut write, "f", "fetch")?;
-        Self::show_help_action(&mut write, "p", "pull")?;
-        Self::show_help_action(&mut write, "P", "push")?;
+            write.queue(cursor::MoveToNextLine(1))?;
 
-        write.queue(cursor::MoveToNextLine(1))?;
-
-        Self::show_help_action(&mut write, "tn", "new tag")?;
+            Self::show_help_action(&mut write, "tn", "new tag")?;
+        }
 
         write.queue(cursor::MoveToNextLine(1))?;
 
         Self::show_help_action(&mut write, "bb", "list branches")?;
-        Self::show_help_action(&mut write, "bn", "new branch")?;
-        Self::show_help_action(&mut write, "bd", "delete branch")?;
+        if !is_read_only {
+            Self::show_help_action(&mut write, "bn", "new branch")?;
+            Self::show_help_action(&mut write, "bd", "delete branch")?;
 
-        write.queue(cursor::MoveToNextLine(1))?;
+            write.queue(cursor::MoveToNextLine(1))?;
 
-        Self::show_help_action(&mut write, "x", "custom command")?;
+            Self::show_help_action(&mut write, "x", "custom command")?;
+        }
 
         write.flush()?;
         Ok(Ok(String::from_utf8(write)?))
